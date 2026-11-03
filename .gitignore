@@ -1,0 +1,14 @@
+node_modules/
+dist/
+functions/lib/
+.env*
+!.env.example
+*-debug.log
+.firebase/
+*.tsbuildinfo
+# Local deployment metadata and private credentials
+.vercel/
+*.pem
+*.key
+*service-account*.json
+*firebase-adminsdk*.json

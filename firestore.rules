@@ -1,0 +1,121 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+  function signedIn() { return request.auth != null; }
+  function home(id) { return get(/databases/$(database)/documents/households/$(id)).data; }
+  function afterHome(id) { return getAfter(/databases/$(database)/documents/households/$(id)).data; }
+  function member(id) { return signedIn() && request.auth.uid in home(id).memberUids; }
+  // Reject malformed manual provisioning as well as unauthorized membership changes.
+  function validMembers(h) {
+   return h.memberUids is list && h.memberUids.size() == 2
+    && h.memberUids[0] is string && h.memberUids[1] is string
+    && h.memberUids[0].size() > 0 && h.memberUids[1].size() > 0
+    && h.memberUids[0] != h.memberUids[1]
+    && h.names is map && h.names.keys().hasAll(h.memberUids) && h.names.keys().hasOnly(h.memberUids);
+  }
+  function validId(id) { return id is string && id.matches('^[a-zA-Z0-9_-]{1,100}$'); }
+  function validTotals(t, h) {
+   return t is map && t.keys().hasAll(h.memberUids) && t.keys().hasOnly(h.memberUids)
+    && t[h.memberUids[0]] is int && t[h.memberUids[1]] is int
+    && t[h.memberUids[0]] >= 0 && t[h.memberUids[1]] >= 0
+    && t[h.memberUids[0]] <= 9007199254740991 && t[h.memberUids[1]] <= 9007199254740991;
+  }
+  function contribution(e, uid) { return !e.deleted && e.payerUid == uid ? e.amountYen : 0; }
+  function calendarDate(s) {
+   let parts = s.split('-');
+   let y = int(parts[0]);
+   let m = int(parts[1]);
+   let d = int(parts[2]);
+   let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+   let days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+   return y >= 1 && y <= 9999 && d <= days[m - 1];
+  }
+  function validExpense(e, h) {
+   return e.keys().hasAll(['title','amountYen','payerUid','occurredAt','cycleId','createdAt','updatedAt','createdByUid','deleted'])
+    && e.keys().hasOnly(['title','amountYen','payerUid','occurredAt','cycleId','createdAt','updatedAt','createdByUid','deleted'])
+    && e.title is string && e.title.size() >= 1 && e.title.size() <= 120 && e.title.matches('.*[^\\s].*')
+    && e.amountYen is int && e.amountYen >= 1 && e.amountYen <= 100000000
+    && e.payerUid in h.memberUids && e.createdByUid in h.memberUids
+    && e.occurredAt is string && e.occurredAt.matches('^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$')
+    && calendarDate(e.occurredAt)
+    && e.cycleId == h.currentCycleId && e.deleted is bool
+    && e.createdAt is timestamp && e.updatedAt == request.time;
+  }
+  function expenseChange(id, before, after) {
+   let path = /databases/$(database)/documents/households/$(id)/expenses/$(after.mutation.id);
+   let old = exists(path) ? get(path).data : {'deleted':true,'payerUid':'','amountYen':0};
+   let next = getAfter(path).data;
+   let a = before.memberUids[0];
+   let b = before.memberUids[1];
+   return after.diff(before).affectedKeys().hasOnly(['revision','mutation','currentPaidTotals'])
+    && (!exists(path) || (!old.deleted && old.cycleId == before.currentCycleId))
+    && validExpense(next, before)
+    && after.currentPaidTotals[a] == before.currentPaidTotals[a] + contribution(next,a) - contribution(old,a)
+    && after.currentPaidTotals[b] == before.currentPaidTotals[b] + contribution(next,b) - contribution(old,b);
+  }
+  function settlementData(s, h) {
+   let a = h.memberUids[0];
+   let b = h.memberUids[1];
+   let difference = h.currentPaidTotals[a] - h.currentPaidTotals[b];
+   return s.keys().hasAll(['cycleId','fromUid','toUid','amountYen','settledAt','paidTotalsSnapshot'])
+    && s.keys().hasOnly(['cycleId','fromUid','toUid','amountYen','settledAt','paidTotalsSnapshot'])
+    && s.cycleId == h.currentCycleId && s.settledAt == request.time
+    && s.paidTotalsSnapshot == h.currentPaidTotals
+    && s.fromUid == (difference > 0 ? b : a) && s.toUid == (difference > 0 ? a : b)
+    && s.amountYen is int && s.amountYen == int(math.floor(math.abs(difference) / 2.0)) && s.amountYen >= 1;
+  }
+  function settleChange(id, before, after) {
+   let path = /databases/$(database)/documents/households/$(id)/settlements/$(before.currentCycleId);
+   return after.diff(before).affectedKeys().hasOnly(['revision','mutation','currentPaidTotals','currentCycleId'])
+    && after.mutation.id == before.currentCycleId && !exists(path)
+    && validId(after.currentCycleId) && after.currentCycleId != before.currentCycleId
+    && !exists(/databases/$(database)/documents/households/$(id)/settlements/$(after.currentCycleId))
+    && after.currentPaidTotals[before.memberUids[0]] == 0 && after.currentPaidTotals[before.memberUids[1]] == 0
+    && settlementData(getAfter(path).data, before);
+  }
+  match /users/{uid} { allow get: if signedIn() && request.auth.uid == uid; }
+  match /households/{id} {
+   allow read: if member(id);
+   // Initial household and both user mappings are provisioned in Console, never by clients.
+   allow update: if member(id)
+    && validMembers(resource.data)
+    && validTotals(resource.data.currentPaidTotals, resource.data)
+    && request.resource.data.revision == resource.data.revision + 1
+    && request.resource.data.revision is int
+    && request.resource.data.mutation.keys().hasOnly(['kind','id'])
+    && validId(request.resource.data.mutation.id)
+    && validTotals(request.resource.data.currentPaidTotals, resource.data)
+    && (
+     (request.resource.data.mutation.kind == 'expense' && expenseChange(id,resource.data,request.resource.data))
+     || (request.resource.data.mutation.kind == 'settle' && settleChange(id,resource.data,request.resource.data))
+     || (request.resource.data.mutation.kind == 'rename'
+      && request.resource.data.mutation.id == request.auth.uid
+      && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['revision','mutation','names'])
+      && request.resource.data.names.diff(resource.data.names).affectedKeys().hasOnly([request.auth.uid])
+      && request.resource.data.names[request.auth.uid] is string
+      && request.resource.data.names[request.auth.uid].size() >= 1
+      && request.resource.data.names[request.auth.uid].size() <= 30)
+    );
+   match /expenses/{expenseId} {
+    allow read: if member(id);
+    allow create, update: if member(id)
+     && validId(expenseId) && validExpense(request.resource.data, home(id))
+     && afterHome(id).revision == home(id).revision + 1
+     && afterHome(id).mutation == {'kind':'expense','id':expenseId}
+     && (resource == null
+      ? (!request.resource.data.deleted && request.resource.data.createdByUid == request.auth.uid && request.resource.data.createdAt == request.time)
+      : (!resource.data.deleted && resource.data.cycleId == home(id).currentCycleId
+       && request.resource.data.createdAt == resource.data.createdAt && request.resource.data.createdByUid == resource.data.createdByUid
+       && (!request.resource.data.deleted || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['deleted','updatedAt']))));
+   }
+   match /settlements/{cycleId} {
+    allow read: if member(id);
+    allow create: if member(id) && cycleId == home(id).currentCycleId
+     && settlementData(request.resource.data,home(id))
+     && afterHome(id).revision == home(id).revision + 1
+     && afterHome(id).mutation == {'kind':'settle','id':cycleId}
+     && afterHome(id).currentCycleId != cycleId;
+   }
+  }
+ }
+}
